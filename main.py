@@ -92,6 +92,12 @@ def load_config():
             "HOTNESS_WEIGHT": config_data["weight"]["hotness_weight"],
         },
         "PLATFORMS": config_data["platforms"],
+        "AI_ANALYSIS": {
+            "ENABLED": config_data.get("ai_analysis", {}).get("enabled", True),
+            "FORECAST_WINDOW": config_data.get("ai_analysis", {}).get(
+                "forecast_window", "未来6-12小时"
+            ),
+        },
     }
 
     # Webhook配置（环境变量优先）
@@ -1272,6 +1278,106 @@ def count_word_frequency(
     return stats, total_titles
 
 
+def build_group_ai_insight(
+        stat: Dict, total_platforms: int, forecast_window: str = "未来6-12小时"
+) -> Dict:
+    """基于板块统计结果生成 AI 分析与趋势预测（本地智能生成）"""
+    titles = stat.get("titles", [])
+    if not titles:
+        return {
+            "analysis": "该板块暂无可分析数据。",
+            "prediction": f"{forecast_window}内该板块热度预计保持平稳。",
+            "direction": "平稳",
+            "confidence": 45,
+            "chart": [
+                {"label": "热度", "value": 0},
+                {"label": "动量", "value": 0},
+                {"label": "扩散", "value": 0},
+                {"label": "稳定", "value": 0},
+            ],
+        }
+
+    total_items = max(len(titles), 1)
+    new_count = sum(1 for t in titles if t.get("is_new"))
+    new_ratio = new_count / total_items
+
+    avg_count = sum(t.get("count", 1) for t in titles) / total_items
+    avg_best_rank = sum(min(t.get("ranks") or [30]) for t in titles) / total_items
+
+    source_count = len({t.get("source_name", "") for t in titles if t.get("source_name")})
+    source_coverage = source_count / max(total_platforms, 1)
+
+    rank_span_sum = sum(
+        (max(t.get("ranks") or [30]) - min(t.get("ranks") or [30])) for t in titles
+    )
+    rank_volatility = rank_span_sum / total_items
+
+    hotness = min(
+        100,
+        int(
+            (min(avg_count, 12) / 12) * 40
+            + (max(0, 30 - avg_best_rank) / 30) * 35
+            + source_coverage * 25
+        ),
+    )
+    momentum = min(
+        100,
+        int(
+            new_ratio * 60
+            + (max(0, 12 - avg_best_rank) / 12) * 25
+            + (min(avg_count, 10) / 10) * 15
+        ),
+    )
+    diffusion = min(100, int(source_coverage * 100))
+    stability = max(5, min(100, int(100 - min(rank_volatility, 20) * 4.5)))
+
+    trend_score = momentum * 0.55 + hotness * 0.3 + diffusion * 0.15
+    if trend_score >= 62:
+        direction = "上升"
+    elif trend_score >= 45:
+        direction = "平稳"
+    else:
+        direction = "回落"
+
+    confidence = int(min(95, max(45, 50 + abs(momentum - 50) * 0.6 + diffusion * 0.15)))
+
+    analysis = (
+        f"该板块当前收录 {stat.get('count', 0)} 条热点，覆盖 {source_count} 个来源平台，"
+        f"平均热榜排名约 {avg_best_rank:.1f} 位，标题平均出现 {avg_count:.1f} 次。"
+    )
+
+    if direction == "上升":
+        prediction = (
+            f"{forecast_window}内热度大概率继续抬升，新增话题占比 {new_ratio * 100:.0f}% ，"
+            "建议持续跟踪头部话题并预留快速响应窗口。"
+        )
+    elif direction == "回落":
+        prediction = (
+            f"{forecast_window}内热度可能逐步回落，新增驱动偏弱，"
+            "建议以观察延续性为主，避免过度追高。"
+        )
+    else:
+        prediction = (
+            f"{forecast_window}内预计维持震荡平稳，"
+            "热点有延续但爆发性有限，可按常规节奏持续关注。"
+        )
+
+    chart = [
+        {"label": "热度", "value": hotness},
+        {"label": "动量", "value": momentum},
+        {"label": "扩散", "value": diffusion},
+        {"label": "稳定", "value": stability},
+    ]
+
+    return {
+        "analysis": analysis,
+        "prediction": prediction,
+        "direction": direction,
+        "confidence": confidence,
+        "chart": chart,
+    }
+
+
 # === 报告生成 ===
 def prepare_report_data(
         stats: List[Dict],
@@ -1332,6 +1438,10 @@ def prepare_report_data(
                     )
 
     processed_stats = []
+    total_platforms = len(id_to_name) if id_to_name else len(CONFIG["PLATFORMS"])
+    ai_enabled = CONFIG["AI_ANALYSIS"]["ENABLED"]
+    forecast_window = CONFIG["AI_ANALYSIS"]["FORECAST_WINDOW"]
+
     for stat in stats:
         if stat["count"] <= 0:
             continue
@@ -1351,12 +1461,29 @@ def prepare_report_data(
             }
             processed_titles.append(processed_title)
 
+        ai_insight = build_group_ai_insight(
+            stat, total_platforms=total_platforms, forecast_window=forecast_window
+        )
+
         processed_stats.append(
             {
                 "word": stat["word"],
                 "count": stat["count"],
                 "percentage": stat.get("percentage", 0),
                 "titles": processed_titles,
+                "ai_analysis": (
+                    ai_insight["analysis"] if ai_enabled else ""
+                ),
+                "ai_prediction": (
+                    ai_insight["prediction"] if ai_enabled else ""
+                ),
+                "prediction_direction": (
+                    ai_insight["direction"] if ai_enabled else "平稳"
+                ),
+                "prediction_confidence": (
+                    ai_insight["confidence"] if ai_enabled else 50
+                ),
+                "trend_chart": ai_insight["chart"] if ai_enabled else [],
             }
         )
 
@@ -1886,6 +2013,104 @@ def render_html_content(
                 font-family: 'SF Mono', Consolas, monospace;
             }
 
+            .ai-insight-card {
+                background: #f8fafc;
+                border: 1px solid #e2e8f0;
+                border-radius: 10px;
+                padding: 14px;
+                margin: 0 0 14px 0;
+            }
+
+            .ai-insight-top {
+                display: flex;
+                align-items: center;
+                flex-wrap: wrap;
+                gap: 8px;
+                margin-bottom: 10px;
+            }
+
+            .ai-badge {
+                font-size: 11px;
+                font-weight: 700;
+                color: white;
+                background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+                border-radius: 999px;
+                padding: 3px 10px;
+            }
+
+            .trend-badge {
+                font-size: 11px;
+                font-weight: 700;
+                border-radius: 999px;
+                padding: 3px 10px;
+            }
+
+            .trend-badge.up {
+                color: #065f46;
+                background: #d1fae5;
+            }
+
+            .trend-badge.flat {
+                color: #92400e;
+                background: #fef3c7;
+            }
+
+            .trend-badge.down {
+                color: #991b1b;
+                background: #fee2e2;
+            }
+
+            .confidence-pill {
+                font-size: 11px;
+                color: #334155;
+                background: #e2e8f0;
+                border-radius: 999px;
+                padding: 3px 10px;
+                font-weight: 600;
+            }
+
+            .ai-text {
+                font-size: 13px;
+                color: #334155;
+                margin-bottom: 8px;
+            }
+
+            .ai-text:last-child {
+                margin-bottom: 0;
+            }
+
+            .metric-row {
+                display: grid;
+                grid-template-columns: 34px 1fr 34px;
+                gap: 8px;
+                align-items: center;
+                margin: 6px 0;
+            }
+
+            .metric-label {
+                font-size: 11px;
+                color: #64748b;
+            }
+
+            .metric-track {
+                height: 6px;
+                background: #e2e8f0;
+                border-radius: 999px;
+                overflow: hidden;
+            }
+
+            .metric-fill {
+                height: 100%;
+                background: linear-gradient(90deg, #60a5fa 0%, #8b5cf6 100%);
+                border-radius: 999px;
+            }
+
+            .metric-value {
+                font-size: 11px;
+                color: #475569;
+                text-align: right;
+            }
+
             @media (max-width: 480px) {
                 body { padding: 12px; }
                 .header { padding: 24px 20px; }
@@ -1982,6 +2207,17 @@ def render_html_content(
                 count_class = ""
 
             escaped_word = html_escape(stat["word"])
+            ai_analysis = html_escape(stat.get("ai_analysis", ""))
+            ai_prediction = html_escape(stat.get("ai_prediction", ""))
+            prediction_direction = stat.get("prediction_direction", "平稳")
+            prediction_confidence = stat.get("prediction_confidence", 50)
+
+            if prediction_direction == "上升":
+                direction_class = "up"
+            elif prediction_direction == "回落":
+                direction_class = "down"
+            else:
+                direction_class = "flat"
 
             html += f"""
                 <div class="word-group">
@@ -1991,6 +2227,32 @@ def render_html_content(
                             <div class="word-count {count_class}">{count} 条</div>
                         </div>
                         <div class="word-index">{i}/{total_count}</div>
+                    </div>"""
+
+            if ai_analysis or ai_prediction:
+                html += f"""
+                    <div class="ai-insight-card">
+                        <div class="ai-insight-top">
+                            <span class="ai-badge">AI分析</span>
+                            <span class="trend-badge {direction_class}">趋势：{html_escape(prediction_direction)}</span>
+                            <span class="confidence-pill">置信度 {prediction_confidence}%</span>
+                        </div>
+                        <div class="ai-text">{ai_analysis}</div>
+                        <div class="ai-text">预测：{ai_prediction}</div>"""
+
+                for metric in stat.get("trend_chart", []):
+                    metric_label = html_escape(metric.get("label", "指标"))
+                    metric_value = max(0, min(100, int(metric.get("value", 0))))
+                    html += f"""
+                        <div class="metric-row">
+                            <div class="metric-label">{metric_label}</div>
+                            <div class="metric-track">
+                                <div class="metric-fill" style="width: {metric_value}%"></div>
+                            </div>
+                            <div class="metric-value">{metric_value}</div>
+                        </div>"""
+
+                html += """
                     </div>"""
 
             # 处理每个词组下的新闻标题，给每条新闻标上序号
@@ -3543,9 +3805,31 @@ def generate_api_data(
 
     for stat in stats:
         if stat["count"] > 0:
+            if CONFIG["AI_ANALYSIS"]["ENABLED"]:
+                ai_insight = build_group_ai_insight(
+                    stat,
+                    total_platforms=len(final_id_to_name),
+                    forecast_window=CONFIG["AI_ANALYSIS"]["FORECAST_WINDOW"],
+                )
+            else:
+                ai_insight = {
+                    "analysis": "",
+                    "prediction": "",
+                    "direction": "平稳",
+                    "confidence": 50,
+                    "chart": [],
+                }
+
             trend_item = {
                 "keyword_group": stat["word"],
                 "match_count": stat["count"],
+                "ai_insight": {
+                    "analysis": ai_insight["analysis"],
+                    "prediction": ai_insight["prediction"],
+                    "direction": ai_insight["direction"],
+                    "confidence": ai_insight["confidence"],
+                    "chart": ai_insight["chart"],
+                },
                 "titles": [],
             }
             for title_data in stat["titles"]:
