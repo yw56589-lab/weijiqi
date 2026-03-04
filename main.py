@@ -97,6 +97,9 @@ def load_config():
             "FORECAST_WINDOW": config_data.get("ai_analysis", {}).get(
                 "forecast_window", "未来6-12小时"
             ),
+            "GENERATE_CHART": config_data.get("ai_analysis", {}).get(
+                "generate_chart", False
+            ),
         },
     }
 
@@ -291,6 +294,14 @@ def html_escape(text: str) -> str:
         .replace('"', "&quot;")
         .replace("'", "&#x27;")
     )
+
+
+def truncate_text(text: str, max_length: int = 80) -> str:
+    """文本截断，避免通知内容过长"""
+    cleaned = clean_title(text)
+    if len(cleaned) <= max_length:
+        return cleaned
+    return cleaned[: max(1, max_length - 1)] + "…"
 
 
 # === 推送记录管理 ===
@@ -1279,7 +1290,10 @@ def count_word_frequency(
 
 
 def build_group_ai_insight(
-        stat: Dict, total_platforms: int, forecast_window: str = "未来6-12小时"
+        stat: Dict,
+        total_platforms: int,
+        forecast_window: str = "未来6-12小时",
+        generate_chart: bool = True,
 ) -> Dict:
     """基于板块统计结果生成 AI 分析与趋势预测（本地智能生成）"""
     titles = stat.get("titles", [])
@@ -1289,12 +1303,16 @@ def build_group_ai_insight(
             "prediction": f"{forecast_window}内该板块热度预计保持平稳。",
             "direction": "平稳",
             "confidence": 45,
-            "chart": [
-                {"label": "热度", "value": 0},
-                {"label": "动量", "value": 0},
-                {"label": "扩散", "value": 0},
-                {"label": "稳定", "value": 0},
-            ],
+            "chart": (
+                [
+                    {"label": "热度", "value": 0},
+                    {"label": "动量", "value": 0},
+                    {"label": "扩散", "value": 0},
+                    {"label": "稳定", "value": 0},
+                ]
+                if generate_chart
+                else []
+            ),
         }
 
     total_items = max(len(titles), 1)
@@ -1362,12 +1380,16 @@ def build_group_ai_insight(
             "热点有延续但爆发性有限，可按常规节奏持续关注。"
         )
 
-    chart = [
-        {"label": "热度", "value": hotness},
-        {"label": "动量", "value": momentum},
-        {"label": "扩散", "value": diffusion},
-        {"label": "稳定", "value": stability},
-    ]
+    chart = (
+        [
+            {"label": "热度", "value": hotness},
+            {"label": "动量", "value": momentum},
+            {"label": "扩散", "value": diffusion},
+            {"label": "稳定", "value": stability},
+        ]
+        if generate_chart
+        else []
+    )
 
     return {
         "analysis": analysis,
@@ -1440,6 +1462,7 @@ def prepare_report_data(
     processed_stats = []
     total_platforms = len(id_to_name) if id_to_name else len(CONFIG["PLATFORMS"])
     ai_enabled = CONFIG["AI_ANALYSIS"]["ENABLED"]
+    chart_enabled = CONFIG["AI_ANALYSIS"].get("GENERATE_CHART", False)
     forecast_window = CONFIG["AI_ANALYSIS"]["FORECAST_WINDOW"]
 
     for stat in stats:
@@ -1462,7 +1485,10 @@ def prepare_report_data(
             processed_titles.append(processed_title)
 
         ai_insight = build_group_ai_insight(
-            stat, total_platforms=total_platforms, forecast_window=forecast_window
+            stat,
+            total_platforms=total_platforms,
+            forecast_window=forecast_window,
+            generate_chart=chart_enabled,
         )
 
         processed_stats.append(
@@ -3806,10 +3832,12 @@ def generate_api_data(
     for stat in stats:
         if stat["count"] > 0:
             if CONFIG["AI_ANALYSIS"]["ENABLED"]:
+                chart_enabled = CONFIG["AI_ANALYSIS"].get("GENERATE_CHART", False)
                 ai_insight = build_group_ai_insight(
                     stat,
                     total_platforms=len(final_id_to_name),
                     forecast_window=CONFIG["AI_ANALYSIS"]["FORECAST_WINDOW"],
+                    generate_chart=chart_enabled,
                 )
             else:
                 ai_insight = {
@@ -3895,6 +3923,676 @@ def generate_static_api_files(analyzer: "NewsAnalyzer"):
     print(f"静态API文件已成功生成: {output_path}")
 
 
+def _normalize_title_for_dedupe(title: str) -> str:
+    """归一化标题用于去重"""
+    normalized = clean_title(title).lower()
+    normalized = re.sub(r"[^\w\u4e00-\u9fff]+", "", normalized)
+    return normalized
+
+
+def _dedupe_titles_for_summary(title_items: List[Dict], max_items: int = 15) -> List[Dict]:
+    """标题去重并限制数量"""
+    unique_items = []
+    seen = set()
+
+    for item in title_items:
+        title = clean_title(item.get("title", ""))
+        if not title:
+            continue
+
+        key = _normalize_title_for_dedupe(title)
+        if not key or key in seen:
+            continue
+
+        seen.add(key)
+        copied = item.copy()
+        copied["title"] = title
+        unique_items.append(copied)
+
+        if len(unique_items) >= max_items:
+            break
+
+    return unique_items
+
+
+def _extract_topic_terms(texts: List[str], top_n: int = 6) -> List[str]:
+    """从标题中提取高频主题词（轻量规则）"""
+    stop_words = {
+        "今天",
+        "最新",
+        "消息",
+        "相关",
+        "表示",
+        "发布",
+        "回应",
+        "进行",
+        "已经",
+        "我们",
+        "你们",
+        "他们",
+        "自己",
+        "这个",
+        "那个",
+        "出现",
+        "引发",
+        "关注",
+        "持续",
+        "重要",
+        "全面",
+        "再次",
+        "当前",
+        "数据",
+        "报道",
+        "news",
+        "china",
+        "today",
+        "update",
+    }
+
+    term_count = {}
+    pattern = re.compile(r"[\u4e00-\u9fff]{2,8}|[A-Za-z][A-Za-z0-9\-]{1,20}")
+
+    for text in texts:
+        for token in pattern.findall(clean_title(text)):
+            normalized = token.lower() if re.match(r"[A-Za-z]", token) else token
+            if normalized in stop_words:
+                continue
+            if normalized.isdigit() or len(normalized) < 2:
+                continue
+            term_count[normalized] = term_count.get(normalized, 0) + 1
+
+    sorted_terms = sorted(term_count.items(), key=lambda x: (-x[1], -len(x[0]), x[0]))
+
+    selected = []
+    for term, count in sorted_terms:
+        # 优先保留高频词；低频词只在候选不足时保留
+        if count < 2 and len(selected) >= 3:
+            continue
+
+        display = term.upper() if re.fullmatch(r"[a-z0-9\-]+", term) and len(term) <= 4 else term
+        selected.append(display)
+        if len(selected) >= top_n:
+            break
+
+    return selected
+
+
+def _infer_primary_domain(keyword: str, texts: List[str]) -> str:
+    """在政治/经济/科技中选择一个最相关领域"""
+    domain_keywords = {
+        "政治": [
+            "外交",
+            "政府",
+            "政策",
+            "国务院",
+            "法案",
+            "选举",
+            "冲突",
+            "战争",
+            "国际",
+            "制裁",
+            "军方",
+            "领导人",
+            "中方",
+            "美国",
+            "欧盟",
+            "白宫",
+        ],
+        "经济": [
+            "经济",
+            "市场",
+            "股",
+            "金融",
+            "贸易",
+            "通胀",
+            "就业",
+            "楼市",
+            "消费",
+            "投资",
+            "企业",
+            "业绩",
+            "油价",
+            "汇率",
+            "财政",
+            "税",
+        ],
+        "科技": [
+            "科技",
+            "ai",
+            "人工智能",
+            "芯片",
+            "算法",
+            "模型",
+            "算力",
+            "机器人",
+            "自动驾驶",
+            "半导体",
+            "软件",
+            "开源",
+            "手机",
+            "互联网",
+            "平台",
+            "数据中心",
+        ],
+    }
+
+    text_blob = " ".join([keyword] + texts).lower()
+    scores = {}
+    for domain, words in domain_keywords.items():
+        scores[domain] = sum(text_blob.count(w.lower()) for w in words)
+
+    if all(score == 0 for score in scores.values()):
+        return "经济"
+    return max(scores.items(), key=lambda x: x[1])[0]
+
+
+def _analyze_emotion_profile(texts: List[str]) -> Dict:
+    """简易情绪分析（正/中/负）"""
+    positive_words = [
+        "上涨",
+        "增长",
+        "突破",
+        "利好",
+        "回暖",
+        "创新高",
+        "盈利",
+        "改善",
+        "提振",
+        "合作",
+        "加速",
+        "成功",
+    ]
+    negative_words = [
+        "下跌",
+        "下滑",
+        "回落",
+        "亏损",
+        "裁员",
+        "冲突",
+        "危机",
+        "风险",
+        "制裁",
+        "封锁",
+        "动荡",
+        "压力",
+        "暴跌",
+        "紧张",
+    ]
+
+    positive = 0
+    neutral = 0
+    negative = 0
+
+    for text in texts:
+        lower_text = clean_title(text).lower()
+        p_score = sum(1 for w in positive_words if w in lower_text)
+        n_score = sum(1 for w in negative_words if w in lower_text)
+
+        if p_score == 0 and n_score == 0:
+            neutral += 1
+        elif p_score >= n_score:
+            positive += 1
+        else:
+            negative += 1
+
+    total = max(1, positive + neutral + negative)
+    positive_pct = int(round(positive * 100 / total))
+    neutral_pct = int(round(neutral * 100 / total))
+    negative_pct = max(0, 100 - positive_pct - neutral_pct)
+
+    if negative_pct >= 45:
+        label = "谨慎"
+        trend_text = "风险议题占比偏高，舆情偏谨慎"
+    elif positive_pct >= 45:
+        label = "积极"
+        trend_text = "正向信号更集中，关注度持续聚集"
+    else:
+        label = "中性"
+        trend_text = "观点分化较明显，舆情呈震荡状态"
+
+    return {
+        "positive_pct": positive_pct,
+        "neutral_pct": neutral_pct,
+        "negative_pct": negative_pct,
+        "label": label,
+        "trend_text": trend_text,
+    }
+
+
+def _render_text_bar(percentage: int, width: int = 10) -> str:
+    """文本柱状图（用于企业微信 markdown）"""
+    p = max(0, min(100, int(percentage)))
+    filled = int(round(p / 100 * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+def _build_keyword_core_digest(
+        keyword: str, title_items: List[Dict], max_news_per_keyword: int = 15
+) -> Dict:
+    """构建单个关键词的核心摘要与影响分析"""
+    deduped_titles = _dedupe_titles_for_summary(title_items, max_items=max_news_per_keyword)
+    title_texts = [item.get("title", "") for item in deduped_titles]
+    domain = _infer_primary_domain(keyword, title_texts)
+    emotion = _analyze_emotion_profile(title_texts)
+
+    terms = _extract_topic_terms(title_texts, top_n=4)
+    if terms:
+        summary = (
+            f"去重后采样{len(deduped_titles)}条消息，核心围绕{'、'.join(terms)}展开，"
+            "讨论焦点集中在当前时段的关键进展与直接影响。"
+        )
+    else:
+        summary = (
+            f"去重后采样{len(deduped_titles)}条消息，关键词讨论集中，"
+            "主要围绕事件最新动态及其影响面展开。"
+        )
+    core_summary = truncate_text(summary, 120)
+
+    impact_templates = {
+        "政治": "该话题对政策沟通与国际博弈预期影响更直接，可能改变公共议题排序与治理关注重点。",
+        "经济": "该话题对市场风险偏好与行业景气判断影响更直接，可能引导资金配置与经营预期再评估。",
+        "科技": "该话题对技术路线与产业落地节奏影响更直接，可能推动研发投入方向与竞争格局调整。",
+    }
+    impact_text = impact_templates.get(domain, impact_templates["经济"])
+
+    analysis = (
+        f"【{domain}影响】{impact_text}"
+        f" 情绪以{emotion['label']}为主（正面{emotion['positive_pct']}% / 中性{emotion['neutral_pct']}% / 负面{emotion['negative_pct']}%），"
+        f"{emotion['trend_text']}。"
+    )
+
+    emotion_chart = (
+        f"情绪图：正 {_render_text_bar(emotion['positive_pct'])} {emotion['positive_pct']}% ｜ "
+        f"中 {_render_text_bar(emotion['neutral_pct'])} {emotion['neutral_pct']}% ｜ "
+        f"负 {_render_text_bar(emotion['negative_pct'])} {emotion['negative_pct']}%"
+    )
+
+    return {
+        "keyword": clean_title(keyword),
+        "sampled_count": len(deduped_titles),
+        "core_summary": core_summary,
+        "analysis": analysis,
+        "emotion": emotion,
+        "domain": domain,
+        "emotion_chart": emotion_chart,
+    }
+
+
+def _build_timeslot_wework_content(
+        trends: List[Dict],
+        total_titles: int,
+        generated_at: str,
+        report_url: str = "",
+        min_keywords: int = 5,
+        max_news_per_keyword: int = 15,
+        failed_sources: Optional[List[str]] = None,
+) -> str:
+    """构建“该时段新闻消息汇总”企业微信内容"""
+    target_keywords = max(5, int(min_keywords) if min_keywords else 5)
+
+    sorted_trends = sorted(
+        [t for t in trends if isinstance(t, dict) and t.get("match_count", 0) > 0],
+        key=lambda x: x.get("match_count", 0),
+        reverse=True,
+    )
+
+    selected = sorted_trends[:target_keywords] if sorted_trends else []
+    digests = []
+    for trend in selected:
+        keyword = trend.get("keyword_group", "未命名关键词")
+        titles = trend.get("titles", []) or []
+        digest = _build_keyword_core_digest(
+            keyword, titles, max_news_per_keyword=max_news_per_keyword
+        )
+        digest["original_count"] = int(trend.get("match_count", len(titles)))
+        digests.append(digest)
+
+    domain_count = {"政治": 0, "经济": 0, "科技": 0}
+    weighted_positive = 0
+    weighted_neutral = 0
+    weighted_negative = 0
+    total_weight = 0
+
+    for d in digests:
+        domain = d.get("domain", "经济")
+        if domain in domain_count:
+            domain_count[domain] += 1
+
+        weight = max(1, d.get("sampled_count", 1))
+        total_weight += weight
+        weighted_positive += d["emotion"]["positive_pct"] * weight
+        weighted_neutral += d["emotion"]["neutral_pct"] * weight
+        weighted_negative += d["emotion"]["negative_pct"] * weight
+
+    if total_weight > 0:
+        overall_positive = int(round(weighted_positive / total_weight))
+        overall_neutral = int(round(weighted_neutral / total_weight))
+        overall_negative = max(0, 100 - overall_positive - overall_neutral)
+    else:
+        overall_positive, overall_neutral, overall_negative = 0, 100, 0
+
+    lines = [
+        "**该时段新闻消息汇总**",
+        f"数据时间：{generated_at}",
+        f"总新闻数：{total_titles}",
+        f"关键词总数：{len(sorted_trends)}，本次展示：{len(digests)}",
+    ]
+
+    if report_url:
+        lines.append(f"📎 [查看图表/完整报告]({report_url})")
+
+    if len(sorted_trends) < target_keywords:
+        lines.append(
+            f"⚠️ 当前可用关键词不足 {target_keywords} 个，已按可用数据完成解读。"
+        )
+
+    lines.extend(
+        [
+            "",
+            "**数据图示（文本化）**",
+            (
+                f"领域分布：政 {_render_text_bar(int(domain_count['政治'] * 100 / max(1, len(digests))))} {domain_count['政治']} ｜ "
+                f"经 {_render_text_bar(int(domain_count['经济'] * 100 / max(1, len(digests))))} {domain_count['经济']} ｜ "
+                f"科 {_render_text_bar(int(domain_count['科技'] * 100 / max(1, len(digests))))} {domain_count['科技']}"
+            ),
+            (
+                f"整体情绪：正 {_render_text_bar(overall_positive)} {overall_positive}% ｜ "
+                f"中 {_render_text_bar(overall_neutral)} {overall_neutral}% ｜ "
+                f"负 {_render_text_bar(overall_negative)} {overall_negative}%"
+            ),
+            "",
+        ]
+    )
+
+    for idx, digest in enumerate(digests, 1):
+        lines.append(
+            f"### {idx}. {digest['keyword']}（去重后{digest['original_count']}条，纳入分析{digest['sampled_count']}条）"
+        )
+        lines.append(f"核心内容提炼：{digest['core_summary']}")
+        lines.append(digest["analysis"])
+        lines.append(digest["emotion_chart"])
+        lines.append("")
+
+    if failed_sources:
+        lines.append("⚠️ 请求失败平台：" + "、".join(failed_sources))
+
+    lines.append(
+        f"> 推送时间：{get_beijing_time().strftime('%Y-%m-%d %H:%M:%S')}｜已自动去重｜单关键词最多分析{max_news_per_keyword}条"
+    )
+
+    return "\n".join(lines)
+
+
+def _send_wework_markdown_content(webhook_url: str, content: str) -> bool:
+    """发送企业微信 markdown，超长时自动精简"""
+    max_bytes = CONFIG.get("MESSAGE_BATCH_SIZE", 4000)
+
+    final_content = content
+    if len(final_content.encode("utf-8")) > max_bytes:
+        compact_lines = [line for line in final_content.splitlines() if not line.startswith("情绪图：")]
+        final_content = "\n".join(compact_lines)
+
+    if len(final_content.encode("utf-8")) > max_bytes:
+        final_content = truncate_text(final_content, 1200)
+
+    headers = {"Content-Type": "application/json"}
+    payload = {"msgtype": "markdown", "markdown": {"content": final_content}}
+
+    try:
+        response = requests.post(webhook_url, headers=headers, json=payload, timeout=30)
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("errcode") == 0:
+                return True
+            print(f"企业微信发送失败，错误：{result.get('errmsg')}")
+            return False
+        print(f"企业微信发送失败，状态码：{response.status_code}")
+        return False
+    except Exception as e:
+        print(f"企业微信发送出错：{e}")
+        return False
+
+
+def _build_current_timeslot_trends(
+        results: Dict, id_to_name: Dict, rank_threshold: int
+) -> Tuple[List[Dict], int]:
+    """基于当前批次抓取结果构建趋势结构（不读取历史文件）"""
+    word_groups, filter_words = load_frequency_words()
+
+    # 构建当前批次 title_info，避免读取历史数据
+    time_mark = format_time_filename()
+    title_info = {}
+    for source_id, titles_data in results.items():
+        title_info[source_id] = {}
+        for title, title_data in titles_data.items():
+            title_info[source_id][title] = {
+                "first_time": time_mark,
+                "last_time": time_mark,
+                "count": 1,
+                "ranks": title_data.get("ranks", []),
+                "url": title_data.get("url", ""),
+                "mobileUrl": title_data.get("mobileUrl", ""),
+            }
+
+    stats, total_titles = count_word_frequency(
+        results,
+        word_groups,
+        filter_words,
+        id_to_name,
+        title_info,
+        rank_threshold,
+        new_titles={},
+        mode="daily",
+    )
+
+    trends = []
+    for stat in stats:
+        if stat.get("count", 0) <= 0:
+            continue
+
+        trend_item = {
+            "keyword_group": stat.get("word", "未命名关键词"),
+            "match_count": stat.get("count", 0),
+            "titles": [],
+        }
+        for title_data in stat.get("titles", []):
+            trend_item["titles"].append(
+                {
+                    "title": clean_title(title_data.get("title", "")),
+                    "url": title_data.get("mobileUrl") or title_data.get("url", ""),
+                    "source": title_data.get("source_name", ""),
+                    "ranks": title_data.get("ranks", []),
+                }
+            )
+
+        trends.append(trend_item)
+
+    return trends, total_titles
+
+
+def _supplement_trends_from_terms(
+        results: Dict,
+        id_to_name: Dict,
+        existing_keywords: List[str],
+        needed_count: int,
+) -> List[Dict]:
+    """当关键词数量不足时，用高频主题词补齐（仅当前批次）"""
+    if needed_count <= 0:
+        return []
+
+    all_title_items = []
+    for source_id, titles_data in results.items():
+        source_name = id_to_name.get(source_id, source_id)
+        for title, title_data in titles_data.items():
+            all_title_items.append(
+                {
+                    "title": clean_title(title),
+                    "url": title_data.get("mobileUrl") or title_data.get("url", ""),
+                    "source": source_name,
+                    "ranks": title_data.get("ranks", []),
+                }
+            )
+
+    candidate_terms = _extract_topic_terms(
+        [item["title"] for item in all_title_items], top_n=80
+    )
+    existing_lower = {clean_title(k).lower() for k in existing_keywords}
+
+    supplements = []
+    for term in candidate_terms:
+        term_lower = clean_title(term).lower()
+        if not term_lower:
+            continue
+        if any(term_lower in ek or ek in term_lower for ek in existing_lower if ek):
+            continue
+
+        matched = [
+            item for item in all_title_items if term_lower in item["title"].lower()
+        ]
+        matched = _dedupe_titles_for_summary(matched, max_items=30)
+
+        # 优先保留较有代表性的候选
+        if len(matched) < 2 and len(candidate_terms) > needed_count:
+            continue
+
+        supplements.append(
+            {
+                "keyword_group": term,
+                "match_count": len(matched),
+                "titles": matched,
+            }
+        )
+        existing_lower.add(term_lower)
+
+        if len(supplements) >= needed_count:
+            break
+
+    return supplements
+
+
+def send_existing_wework_summary(
+        api_file_path: str = "api/trends.json",
+        min_keywords: int = 5,
+        max_news_per_keyword: int = 15,
+) -> bool:
+    """
+    读取已生成的 trends.json 并发送企业微信汇总（新版样式）。
+    不重新爬取、不重新生成内容；用于复用已产出数据。
+    """
+    webhook_url = CONFIG.get("WEWORK_WEBHOOK_URL", "")
+    if not webhook_url:
+        print("未配置企业微信Webhook，无法发送汇总（请检查 WEWORK_WEBHOOK_URL）。")
+        return False
+
+    api_file = Path(api_file_path)
+    if not api_file.exists():
+        print(f"未找到已生成的汇总文件: {api_file_path}")
+        return False
+
+    try:
+        with open(api_file, "r", encoding="utf-8") as f:
+            api_data = json.load(f)
+    except Exception as e:
+        print(f"读取已有汇总文件失败: {e}")
+        return False
+
+    trends = [
+        item
+        for item in api_data.get("trends", [])
+        if isinstance(item, dict) and item.get("match_count", 0) > 0
+    ]
+    if not trends:
+        print("已有汇总中没有可发送的关键词数据。")
+        return False
+
+    generated_at = str(api_data.get("generated_at", "未知时间"))
+    generated_at = generated_at.replace("T", " ").split(".")[0]
+    total_titles = api_data.get("total_titles_processed", 0)
+
+    base_url = (CONFIG.get("BASE_URL") or "").rstrip("/")
+    report_url = f"{base_url}/index.html" if base_url else ""
+
+    content = _build_timeslot_wework_content(
+        trends=trends,
+        total_titles=total_titles,
+        generated_at=generated_at,
+        report_url=report_url,
+        min_keywords=min_keywords,
+        max_news_per_keyword=max_news_per_keyword,
+        failed_sources=api_data.get("failed_sources", []),
+    )
+
+    success = _send_wework_markdown_content(webhook_url, content)
+    if success:
+        print("企业微信已发送：复用已生成汇总（新版）")
+    return success
+
+
+def send_current_timeslot_wework_summary(
+        min_keywords: int = 5, max_news_per_keyword: int = 15
+) -> bool:
+    """
+    仅爬取当前时段一次，并按新版规则发送企业微信汇总。
+    不读取历史时段，不做趋势预测，按关键词做去重与核心提炼。
+    """
+    webhook_url = CONFIG.get("WEWORK_WEBHOOK_URL", "")
+    if not webhook_url:
+        print("未配置企业微信Webhook，无法发送当前时段汇总。")
+        return False
+
+    analyzer = NewsAnalyzer()
+
+    ids = []
+    for platform in CONFIG["PLATFORMS"]:
+        if "name" in platform:
+            ids.append((platform["id"], platform["name"]))
+        else:
+            ids.append(platform["id"])
+
+    print("开始单次抓取当前时段数据（仅本次，不读取历史）...")
+    results, id_to_name, failed_ids = analyzer.data_fetcher.crawl_websites(
+        ids, analyzer.request_interval
+    )
+
+    if not results:
+        print("当前时段抓取结果为空，无法生成汇总。")
+        return False
+
+    trends, total_titles = _build_current_timeslot_trends(
+        results, id_to_name, analyzer.rank_threshold
+    )
+
+    target_keywords = max(5, int(min_keywords) if min_keywords else 5)
+    if len(trends) < target_keywords:
+        needed = target_keywords - len(trends)
+        supplements = _supplement_trends_from_terms(
+            results,
+            id_to_name,
+            [t.get("keyword_group", "") for t in trends],
+            needed_count=needed,
+        )
+        trends.extend(supplements)
+
+    generated_at = get_beijing_time().strftime("%Y-%m-%d %H:%M:%S")
+    base_url = (CONFIG.get("BASE_URL") or "").rstrip("/")
+    report_url = f"{base_url}/index.html" if base_url else ""
+
+    content = _build_timeslot_wework_content(
+        trends=trends,
+        total_titles=total_titles,
+        generated_at=generated_at,
+        report_url=report_url,
+        min_keywords=target_keywords,
+        max_news_per_keyword=max_news_per_keyword,
+        failed_sources=failed_ids,
+    )
+
+    success = _send_wework_markdown_content(webhook_url, content)
+    if success:
+        print("企业微信已发送：当前时段汇总（新版）")
+    return success
+
+
 # --- Flask App (如果已安装) ---
 if FLASK_AVAILABLE:
     app = Flask(__name__)
@@ -3939,10 +4637,54 @@ def main():
         action='store_true',
         help='仅生成静态的 trends.json, news.jpg 和相关HTML文件并退出'
     )
+    parser.add_argument(
+        '--send-existing-wework-summary',
+        action='store_true',
+        help='仅复用已生成的 api/trends.json 发送企业微信汇总（不重新爬取/生成）'
+    )
+    parser.add_argument(
+        '--send-current-wework-summary',
+        action='store_true',
+        help='仅抓取当前时段一次并发送企业微信汇总（不读取历史时段）'
+    )
+    parser.add_argument(
+        '--min-keywords',
+        type=int,
+        default=5,
+        help='企业微信汇总最少关键词数（默认 5）'
+    )
+    parser.add_argument(
+        '--max-news-per-keyword',
+        type=int,
+        default=15,
+        help='单关键词参与分析的新闻上限（默认 15）'
+    )
     args = parser.parse_args()
 
     try:
-        if args.serve_api:
+        if args.send_current_wework_summary:
+            print("抓取当前时段并发送企业微信汇总（新版）...")
+            success = send_current_timeslot_wework_summary(
+                min_keywords=args.min_keywords,
+                max_news_per_keyword=args.max_news_per_keyword,
+            )
+            if success:
+                print("当前时段企业微信汇总发送完成。")
+            else:
+                print("当前时段企业微信汇总发送失败或已跳过。")
+
+        elif args.send_existing_wework_summary:
+            print("仅发送企业微信汇总（复用已生成内容）...")
+            success = send_existing_wework_summary(
+                min_keywords=args.min_keywords,
+                max_news_per_keyword=args.max_news_per_keyword,
+            )
+            if success:
+                print("企业微信汇总发送完成。")
+            else:
+                print("企业微信汇总发送失败或已跳过。")
+
+        elif args.serve_api:
             if not FLASK_AVAILABLE:
                 print("错误：无法启动API服务器，因为 Flask 模块未安装。")
                 print("请运行 'pip install Flask' 来安装。")
